@@ -4,10 +4,9 @@ import numpy as np
 import re
 import string
 import matplotlib.pyplot as plt
-import joblib
-import os
+import io
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import LogisticRegression
@@ -15,6 +14,7 @@ from sklearn.svm import LinearSVC
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
+    ConfusionMatrixDisplay,
     classification_report
 )
 from imblearn.over_sampling import SMOTE
@@ -103,90 +103,80 @@ def clean_text(text):
     return text.strip()
 
 # =========================================================
-# AUTO-LABELING (bilingual keyword approach)
+# TEST CSV PARSER
+# FIX: test.csv has a malformed quoting structure where the label
+#      is embedded inside the quoted text field. Parse it manually.
 # =========================================================
 
-POSITIVE_WORDS = [
-    # Indonesian
-    'bagus','baik','senang','suka','positif','menyenangkan','mudah','fleksibel',
-    'membantu','manfaat','efektif','efisien','nyaman','hemat','praktis','keren',
-    'luar biasa','bermanfaat','seru','asik','asyik','menarik','produktif',
-    'meningkat','berkembang','inovatif','kreatif','sukses','berhasil','puas',
-    'memuaskan','mendukung','terbantu','maju','semangat','antusias','setuju',
-    'mendukung','apresiasi','berkualitas','canggih','modern','terjangkau',
-    # English
-    'good','great','excellent','positive','enjoy','like','love','benefit',
-    'improve','innovation','easy','convenient','flexible','helpful','accessible',
-    'effective','efficient','comfortable','affordable','productive','success',
-]
+@st.cache_data(show_spinner="Loading test data…")
+def load_test_csv(path="test.csv"):
+    """
+    test.csv rows look like:
+        "\"text content here\", 0"
+    The label is embedded at the end of the quoted string.
+    This function extracts text and label correctly.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        raw = f.read()
 
-NEGATIVE_WORDS = [
-    # Indonesian
-    'buruk','jelek','susah','sulit','masalah','kendala','lambat','mahal',
-    'membosankan','ganggu','bosan','capek','lelah','stress','melelahkan',
-    'tidak nyaman','kurang','minim','gagal','tidak memuaskan','lemah',
-    'tidak memadai','jaringan','sinyal','gangguan','tidak setuju','mengeluh',
-    'kecewa','malas','berat','membebani','negatif','problematik','repot',
-    'ribet','korupsi','kenaikan','ukt','mahal','keberatan','protes','unjuk rasa',
-    'turun ke jalan','mogok','tuntut','minta mundur','kritik','gagal',
-    # English
-    'bad','poor','difficult','hard','problem','issue','fail','boring',
-    'uncomfortable','expensive','slow','dislike','hate','complaint',
-    'protest','corrupt','unfair','increase','burden','struggle',
-]
+    lines = raw.splitlines()
+    records = []
+    for line in lines[1:]:   # skip header
+        line = line.strip()
+        if not line:
+            continue
+        # strip outer wrapping quote
+        if line.startswith('"') and line.endswith('"'):
+            line = line[1:-1]
+        # extract trailing label digit
+        m = re.match(r'^(.*),\s*([01])\s*$', line)
+        if m:
+            text = m.group(1).strip().strip('"')
+            label = int(m.group(2))
+            records.append({"text": text, "label": label})
 
-def auto_label(text):
-    pos = sum(1 for w in POSITIVE_WORDS if w in text)
-    neg = sum(1 for w in NEGATIVE_WORDS if w in text)
-    if pos > neg:
-        return 1   # Positive
-    return 0       # Negative (default when tied or more negative)
+    return pd.DataFrame(records)
 
 # =========================================================
 # MODEL TRAINING WITH SMOTE
-# FIX: retrain every run using balanced data so both classes
-#      are learnable — the original model only predicted Negative.
+# FIX 1: use correct column 'review_text' (not 'full_text')
+# FIX 2: use the real 'sentiment' column; map 3 classes → binary
+#         (0=Negative → 0, 1=Neutral → 0, 2=Positive → 1)
+# FIX 3: keep SVM as LinearSVC for speed & predict_proba-like support
 # =========================================================
 
 @st.cache_resource(show_spinner="Training balanced model…")
 def train_balanced_model():
-    """
-    Retrain from scratch with:
-    1. Better auto-labeling (bilingual keyword matching)
-    2. SMOTE oversampling to balance classes
-    3. class_weight='balanced' as extra safeguard
-    """
     df = pd.read_csv("train.csv")
-    df["cleaned"] = df["full_text"].apply(clean_text)
-    df["label"]   = df["cleaned"].apply(auto_label)
+    df.columns = df.columns.str.strip().str.lower()
+
+    # FIX 1 & 2: correct column + use real labels mapped to binary
+    df["cleaned"] = df["review_text"].apply(clean_text)
+    df["label"]   = df["sentiment"].map({0: 0, 1: 0, 2: 1}).fillna(0).astype(int)
 
     vec = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
     X = vec.fit_transform(df["cleaned"])
     y = df["label"]
 
-    # SMOTE needs at least k_neighbors+1 samples in minority class
+    # SMOTE — guard k_neighbors against tiny minority class
     min_samples = int(y.value_counts().min())
     k = min(5, min_samples - 1)
     sm = SMOTE(random_state=42, k_neighbors=k)
     X_res, y_res = sm.fit_resample(X, y)
 
-    model = LogisticRegression(
-        max_iter=1000,
-        class_weight="balanced",   # extra safety
-        C=1.0,
-        random_state=42
+    model_lr = LogisticRegression(
+        max_iter=1000, class_weight="balanced", C=1.0, random_state=42
     )
-    model.fit(X_res, y_res)
+    model_lr.fit(X_res, y_res)
 
-    # Also train NB and SVM for comparison display
-    nb = MultinomialNB()
-    nb.fit(X_res, y_res)
+    model_nb = MultinomialNB()
+    model_nb.fit(X_res, y_res)
 
-    svm = LinearSVC(class_weight="balanced", max_iter=1000, random_state=42)
-    svm.fit(X_res, y_res)
+    model_svm = LinearSVC(class_weight="balanced", max_iter=1000, random_state=42)
+    model_svm.fit(X_res, y_res)
 
     label_dist = df["label"].value_counts().to_dict()
-    return model, nb, svm, vec, df, label_dist, X_res, y_res
+    return model_lr, model_nb, model_svm, vec, df, label_dist, X_res, y_res
 
 model_lr, model_nb, model_svm, vectorizer, train_df, label_dist, X_res, y_res = train_balanced_model()
 
@@ -214,21 +204,18 @@ if menu == "🏠 Home":
         <li>Logistic Regression</li>
         <li>Support Vector Machine (SVM)</li>
     </ul>
-    <b>⚠️ Key improvement:</b> This version retrains the model using SMOTE oversampling
-    to fix class imbalance — the original model predicted <i>everything</i> as Negative.
     </div>
 
     <br>
 
     <div style='background-color:#1a3a2a;padding:20px;border-radius:15px;color:white;border:1px solid #22c55e;'>
-    <h3>✅ What Was Fixed</h3>
+    <h3>✅ Bugs Fixed</h3>
     <ul>
-        <li><b>Original problem:</b> 93% accuracy but 0% recall for Positive class (completely broken)</li>
-        <li><b>Root cause:</b> ~90 Negative vs ~7 Positive samples in test set — model just predicted everything Negative</li>
-        <li><b>Fix 1:</b> Improved auto-labeling with bilingual (Indonesian + English) keyword matching</li>
-        <li><b>Fix 2:</b> SMOTE oversampling balances the training data to 428 vs 428 samples</li>
-        <li><b>Fix 3:</b> <code>class_weight='balanced'</code> as additional safeguard</li>
-        <li><b>Result:</b> Both Positive and Negative are now detected with ~98% F1-score</li>
+        <li><b>Wrong column name:</b> <code>full_text</code> → <code>review_text</code> (train.csv has no full_text column)</li>
+        <li><b>Ignored real labels:</b> Now uses the actual <code>sentiment</code> column (0/1/2) mapped to binary instead of keyword guessing</li>
+        <li><b>Broken test.csv parser:</b> Custom parser now correctly extracts text and label from malformed CSV quoting</li>
+        <li><b>No evaluation metrics:</b> Test Dataset page now shows accuracy, classification report, and confusion matrix</li>
+        <li><b>Slow confidence loop:</b> <code>predict_proba</code> is now called once on the full matrix, not per-row</li>
     </ul>
     </div>
 
@@ -252,11 +239,12 @@ elif menu == "📊 Dataset Overview":
     st.title("📊 Dataset Overview")
 
     df = pd.read_csv("train.csv")
+    df.columns = df.columns.str.strip().str.lower()
     st.subheader("Dataset Information")
     st.write(f"Total Rows: {len(df)}")
     st.write(f"Total Columns: {len(df.columns)}")
 
-    st.subheader("Auto-labeled Sentiment Distribution")
+    st.subheader("Sentiment Distribution (Binary Labels)")
     col1, col2 = st.columns(2)
     neg_count = label_dist.get(0, 0)
     pos_count = label_dist.get(1, 0)
@@ -264,19 +252,20 @@ elif menu == "📊 Dataset Overview":
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-value" style="color:#ef4444;">{neg_count}</div>
-            <div class="metric-label">Negative Samples</div>
+            <div class="metric-label">Negative Samples (sentiment 0 & 1)</div>
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-value">{pos_count}</div>
-            <div class="metric-label">Positive Samples</div>
+            <div class="metric-label">Positive Samples (sentiment 2)</div>
         </div>""", unsafe_allow_html=True)
 
     st.write("")
     st.markdown("""
     <div style='background-color:#1a2a3a;padding:15px;border-radius:10px;color:#93c5fd;'>
-    ℹ️ Labels were assigned automatically using bilingual keyword matching (Indonesian + English).
+    ℹ️ Original <code>sentiment</code> column has 3 classes: 0 (Negative), 1 (Neutral), 2 (Positive).
+    They are mapped to binary: 0 &amp; 1 → Negative, 2 → Positive.
     After SMOTE oversampling, both classes have equal representation during training.
     </div>""", unsafe_allow_html=True)
 
@@ -287,15 +276,14 @@ elif menu == "📊 Dataset Overview":
         ax.set_facecolor("#1f2937")
         ax.tick_params(colors="white")
         ax.title.set_color("white")
+        ax.yaxis.label.set_color("white")
         for spine in ax.spines.values():
             spine.set_edgecolor("#374151")
 
-    # Before SMOTE
     axes[0].bar(["Negative", "Positive"], [neg_count, pos_count], color=["#ef4444", "#22c55e"])
     axes[0].set_title("Before SMOTE (Original)", color="white")
     axes[0].set_ylabel("Count", color="white")
 
-    # After SMOTE
     unique, counts = np.unique(y_res, return_counts=True)
     after = dict(zip(unique.tolist(), counts.tolist()))
     axes[1].bar(["Negative", "Positive"], [after.get(0, 0), after.get(1, 0)], color=["#ef4444", "#22c55e"])
@@ -304,8 +292,9 @@ elif menu == "📊 Dataset Overview":
 
     st.pyplot(fig)
 
-    st.subheader("Sample Training Data (with auto-labels)")
-    display_df = train_df[["full_text", "cleaned", "label"]].copy()
+    st.subheader("Sample Training Data")
+    # FIX: correct column name review_text
+    display_df = train_df[["review_text", "cleaned", "label"]].copy()
     display_df["label"] = display_df["label"].map({0: "Negative", 1: "Positive"})
     st.dataframe(display_df.head(20), use_container_width=True)
 
@@ -317,10 +306,12 @@ elif menu == "🧹 Text Preprocessing":
     st.title("🧹 Text Preprocessing")
 
     df = pd.read_csv("train.csv")
-    sample = df["full_text"].dropna().head(20)
+    df.columns = df.columns.str.strip().str.lower()
+    # FIX: correct column name
+    sample = df["review_text"].dropna().head(20)
     preprocess_df = pd.DataFrame({
-        "Original Text": sample,
-        "Cleaned Text": sample.apply(clean_text)
+        "Original Text": sample.values,
+        "Cleaned Text": sample.apply(clean_text).values
     })
 
     st.dataframe(preprocess_df, use_container_width=True)
@@ -336,16 +327,18 @@ elif menu == "🧹 Text Preprocessing":
 
 # =========================================================
 # TEST DATASET EVALUATION
+# FIX: use custom parser for malformed test.csv
+# FIX: actually evaluate against true labels (accuracy, report, confusion matrix)
+# FIX: compute all confidences in one vectorized call
 # =========================================================
 
 elif menu == "📈 Test Dataset Evaluation":
     st.title("📈 Test Dataset Evaluation")
 
-    test_df = pd.read_csv("test.csv")
-    test_df.columns = test_df.columns.str.strip().str.lower()
-
-    test_df["cleaned"] = test_df["text"].astype(str).apply(clean_text)
+    test_df = load_test_csv("test.csv")
+    test_df["cleaned"] = test_df["text"].apply(clean_text)
     X_test = vectorizer.transform(test_df["cleaned"])
+    y_true = test_df["label"].values
 
     st.subheader("Model Comparison on Test Set")
 
@@ -357,33 +350,56 @@ elif menu == "📈 Test Dataset Evaluation":
 
     for model_name, m in models.items():
         preds = m.predict(X_test)
+        acc   = accuracy_score(y_true, preds)
         pred_labels = ["Positive" if p == 1 else "Negative" for p in preds]
-        pos_count = pred_labels.count("Positive")
-        neg_count = pred_labels.count("Negative")
-        with st.expander(f"📊 {model_name}"):
-            c1, c2 = st.columns(2)
-            c1.metric("Positive Predictions", pos_count)
-            c2.metric("Negative Predictions", neg_count)
+        pos_n = pred_labels.count("Positive")
+        neg_n = pred_labels.count("Negative")
+
+        with st.expander(f"📊 {model_name} — Accuracy: {acc*100:.1f}%"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Accuracy", f"{acc*100:.1f}%")
+            c2.metric("Positive Predictions", pos_n)
+            c3.metric("Negative Predictions", neg_n)
+
+            # Classification report
+            report = classification_report(
+                y_true, preds,
+                target_names=["Negative", "Positive"],
+                output_dict=False
+            )
+            st.text("Classification Report:")
+            st.code(report, language="text")
+
+            # Confusion matrix
+            cm = confusion_matrix(y_true, preds)
+            fig_cm, ax_cm = plt.subplots(figsize=(4, 3))
+            fig_cm.patch.set_facecolor("#1f2937")
+            ax_cm.set_facecolor("#1f2937")
+            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Negative", "Positive"])
+            disp.plot(ax=ax_cm, colorbar=False, cmap="Greens")
+            ax_cm.title.set_color("white")
+            ax_cm.xaxis.label.set_color("white")
+            ax_cm.yaxis.label.set_color("white")
+            ax_cm.tick_params(colors="white")
+            ax_cm.set_title(f"Confusion Matrix — {model_name}", color="white")
+            st.pyplot(fig_cm)
+
             result_df = test_df[["text"]].copy()
-            result_df["Prediction"] = pred_labels
+            result_df["True Label"]  = ["Positive" if l == 1 else "Negative" for l in y_true]
+            result_df["Prediction"]  = pred_labels
+            result_df["Correct"]     = result_df["True Label"] == result_df["Prediction"]
             st.dataframe(result_df, use_container_width=True)
 
     st.subheader("Full Prediction Table (Logistic Regression)")
     preds_lr = model_lr.predict(X_test)
+    # FIX: vectorized predict_proba — one call for all rows
+    proba_lr = model_lr.predict_proba(X_test)
     final_df = test_df[["text"]].copy()
-    final_df["Prediction"] = ["Positive" if p == 1 else "Negative" for p in preds_lr]
-    final_df["Confidence (%)"] = [
-        round(max(model_lr.predict_proba(vectorizer.transform([r["cleaned"]]))[0]) * 100, 1)
-        for _, r in test_df.iterrows()
-    ]
+    final_df["True Label"]      = ["Positive" if l == 1 else "Negative" for l in y_true]
+    final_df["Prediction"]      = ["Positive" if p == 1 else "Negative" for p in preds_lr]
+    final_df["Confidence (%)"]  = [round(max(p) * 100, 1) for p in proba_lr]
+    final_df["Correct"]         = final_df["True Label"] == final_df["Prediction"]
     st.dataframe(final_df, use_container_width=True)
-
-    st.subheader("Cross-Validation Performance on Training Data")
-    st.markdown("""
-    <div style='background-color:#1a3a2a;padding:15px;border-radius:10px;color:#86efac;'>
-    After applying SMOTE, Logistic Regression achieves <b>~98% F1-score on both classes</b>
-    in cross-validation — compared to 0.00 F1 for the Positive class in the original model.
-    </div>""", unsafe_allow_html=True)
 
 # =========================================================
 # SENTIMENT DEMO
@@ -407,8 +423,8 @@ elif menu == "🎓 Sentiment Demo":
 
     chosen_model = {
         "Logistic Regression": model_lr,
-        "Naive Bayes": model_nb,
-        "SVM": model_svm,
+        "Naive Bayes":         model_nb,
+        "SVM":                 model_svm,
     }[chosen_model_name]
 
     user_input = st.text_area(
@@ -421,22 +437,21 @@ elif menu == "🎓 Sentiment Demo":
         if user_input.strip() == "":
             st.warning("Please enter some text.")
         else:
-            cleaned_text = clean_text(user_input)
+            cleaned_text     = clean_text(user_input)
             transformed_text = vectorizer.transform([cleaned_text])
-            prediction = chosen_model.predict(transformed_text)[0]
+            prediction       = chosen_model.predict(transformed_text)[0]
 
-            # Get probabilities (SVM uses decision function, not predict_proba)
             if hasattr(chosen_model, "predict_proba"):
-                probabilities = chosen_model.predict_proba(transformed_text)[0]
+                probabilities  = chosen_model.predict_proba(transformed_text)[0]
                 negative_score = probabilities[0] * 100
                 positive_score = probabilities[1] * 100
-                confidence = max(probabilities) * 100
+                confidence     = max(probabilities) * 100
             else:
-                # SVM: use decision function distance as confidence proxy
-                decision = chosen_model.decision_function(transformed_text)[0]
+                # LinearSVC: use decision_function as proxy
+                decision       = chosen_model.decision_function(transformed_text)[0]
                 positive_score = max(0.0, min(100.0, 50 + decision * 10))
                 negative_score = 100 - positive_score
-                confidence = positive_score if prediction == 1 else negative_score
+                confidence     = positive_score if prediction == 1 else negative_score
 
             st.write("")
             st.subheader("Prediction Result")
@@ -468,10 +483,10 @@ elif menu == "🎓 Sentiment Demo":
             st.code(cleaned_text, language="text")
 
             result_df = pd.DataFrame({
-                "Original Text": [user_input],
-                "Processed Text": [cleaned_text],
-                "Prediction": ["Positive" if prediction == 1 else "Negative"],
-                "Confidence (%)": [round(confidence, 2)]
+                "Original Text":   [user_input],
+                "Processed Text":  [cleaned_text],
+                "Prediction":      ["Positive" if prediction == 1 else "Negative"],
+                "Confidence (%)":  [round(confidence, 2)]
             })
             st.subheader("Prediction Summary")
             st.dataframe(result_df, use_container_width=True)
